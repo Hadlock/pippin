@@ -61,6 +61,7 @@ func main() {
 	mux.HandleFunc("GET /board", handleBoard)
 	mux.HandleFunc("GET /api/projects", handleGetProjects)
 	mux.HandleFunc("POST /api/projects", handleCreateProject)
+	mux.HandleFunc("DELETE /api/projects/{key}", handleDeleteProject)
 	mux.HandleFunc("GET /api/tickets", handleGetTickets)
 	mux.HandleFunc("POST /api/tickets", handleCreateTicket)
 	mux.HandleFunc("POST /api/tickets/{id}/move", handleMoveTicket)
@@ -185,6 +186,29 @@ func handleCreateProject(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, 201, map[string]int{"id": id})
+}
+
+func handleDeleteProject(w http.ResponseWriter, r *http.Request) {
+	key := r.PathValue("key")
+	if key == "" {
+		writeJSON(w, 400, map[string]string{"error": "project key required"})
+		return
+	}
+
+	// Delete project (CASCADE will delete tickets and blocks)
+	result, err := db.Exec("DELETE FROM projects WHERE account_id=$1 AND key=$2", cfg.AccountID, key)
+	if err != nil {
+		writeJSON(w, 500, map[string]string{"error": err.Error()})
+		return
+	}
+
+	rows, _ := result.RowsAffected()
+	if rows == 0 {
+		writeJSON(w, 404, map[string]string{"error": "project not found"})
+		return
+	}
+
+	writeJSON(w, 200, map[string]string{"status": "deleted"})
 }
 
 func handleGetTickets(w http.ResponseWriter, r *http.Request) {
@@ -442,6 +466,8 @@ button:hover,.btn:hover{opacity:0.8}
 .btn-hero{background:var(--accent);font-weight:600;padding:6px 16px;font-size:14px}
 .btn-subtle{background:transparent;color:var(--muted);font-size:11px;padding:3px 8px}
 .btn-subtle:hover{background:var(--panel)}
+.btn-danger{background:#ff6b6b;color:#fff;font-size:11px;padding:3px 8px}
+.btn-danger:hover{background:#ff5252}
 .badge{background:#ff6b6b;color:#fff;padding:2px 6px;border-radius:4px;font-size:11px;margin-right:4px}
 #backlog-col.collapsed .card{display:none}
 select{padding:4px 8px;border:1px solid var(--border);background:var(--card);color:var(--ink);border-radius:4px}
@@ -478,6 +504,9 @@ select{padding:4px 8px;border:1px solid var(--border);background:var(--card);col
   <a href="?sprint=all&project={{.Project}}" class="btn">Show All Tickets</a>
   {{else}}
   <a href="?sprint=current&project={{.Project}}" class="btn">Current Sprint</a>
+  {{end}}
+  {{if and (ge (len .Projects) 3) (ne .Project "ALL")}}
+  <button class="btn btn-danger" onclick="confirmDeleteProject('{{.Project}}')">🗑️ Delete Project</button>
   {{end}}
   <div class="search-box">
     <input type="text" id="search-input" placeholder="🔍 Search tickets..." autocomplete="off">
@@ -602,7 +631,7 @@ select{padding:4px 8px;border:1px solid var(--border);background:var(--card);col
     <form id="project-form" onsubmit="submitProject(event)">
       <div class="form-group">
         <label>Project Key * (e.g., CART, STORE)</label>
-        <input type="text" id="project-key" required pattern="[A-Z0-9]+" placeholder="PROJ" maxlength="10" style="text-transform:uppercase">
+        <input type="text" id="project-key" required pattern="[A-Za-z0-9]+" placeholder="PROJ" maxlength="10" style="text-transform:uppercase">
       </div>
       <div class="form-group">
         <label>Project Name *</label>
@@ -720,6 +749,32 @@ document.addEventListener('keydown', (e) => {
   }
 });
 
+// Delete project with confirmation
+function confirmDeleteProject(projectKey) {
+  const confirmed = confirm(
+    'Delete project ' + projectKey + '?\n\n' +
+    'This will permanently delete the project and ALL its tickets.\n\n' +
+    'This action cannot be undone.'
+  );
+  
+  if (!confirmed) return;
+  
+  fetch('/api/projects/' + projectKey, {
+    method: 'DELETE',
+    headers: {'Content-Type': 'application/json'}
+  })
+  .then(r => r.json())
+  .then(data => {
+    if (data.error) {
+      alert('Error: ' + data.error);
+    } else {
+      // Redirect to all projects view after deletion
+      window.location.href = '/board?sprint=' + (new URLSearchParams(window.location.search).get('sprint') || 'current') + '&project=ALL';
+    }
+  })
+  .catch(err => alert('Error deleting project: ' + err));
+}
+
 // Fuzzy search functionality (fzf-inspired)
 function fuzzyMatch(needle, haystack) {
   needle = needle.toLowerCase();
@@ -768,7 +823,7 @@ function searchTickets() {
     }
     
     // Search in title, project key, assignee, and ID
-    const searchText = `${project}-${id} ${title} ${assignee}`;
+    const searchText = project + '-' + id + ' ' + title + ' ' + assignee;
     const score = fuzzyMatch(query, searchText);
     
     if (score > 0) {
@@ -789,13 +844,13 @@ function clearSearch() {
 
 function updateColumnCounts() {
   ['backlog', 'todo', 'in_progress', 'done'].forEach(state => {
-    const col = document.querySelector(`.col[data-state="${state}"]`);
+    const col = document.querySelector('.col[data-state="' + state + '"]');
     if (!col) return;
     const visible = col.querySelectorAll('.card:not(.search-hidden)').length;
     const header = col.querySelector('h3 span');
     if (header) {
       const text = header.textContent.split('(')[0].trim();
-      header.textContent = `${text} (${visible})`;
+      header.textContent = text + ' (' + visible + ')';
     }
   });
 }
@@ -828,7 +883,7 @@ function getDirection(from, to) {
 }
 
 document.addEventListener('DOMContentLoaded',()=>{
-  document.getElementById('backlog-col').classList.add('collapsed');
+  // Don't auto-collapse backlog anymore - let users see all their tickets
   
   // Add drag event listeners to all cards
   document.querySelectorAll('.card').forEach(card => {
