@@ -385,7 +385,7 @@ func handleAddComment(w http.ResponseWriter, r *http.Request) {
 	// Append new comment with timestamp
 	timestamp := time.Now().Format("2006-01-02 15:04:05")
 	newComment := fmt.Sprintf("[%s] %s", timestamp, req.Comment)
-	
+
 	var updated string
 	if existing == "" {
 		updated = newComment
