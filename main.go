@@ -43,15 +43,22 @@ type Ticket struct {
 	Body       string    `json:"body"`
 	State      string    `json:"state"`
 	Assignee   string    `json:"assignee"`
+	Comments   string    `json:"comments"`
 	CreatedAt  time.Time `json:"created_at"`
 	UpdatedAt  time.Time `json:"updated_at"`
 	ProjectKey string    `json:"project_key,omitempty"`
 	BlockedBy  []string  `json:"blocked_by,omitempty"`
 }
 
+type Comment struct {
+	Timestamp time.Time `json:"timestamp"`
+	Text      string    `json:"text"`
+}
+
 func main() {
 	loadConfig()
 	initDB()
+	initSchema()
 	initTemplate()
 
 	mux := http.NewServeMux()
@@ -63,10 +70,16 @@ func main() {
 	mux.HandleFunc("POST /api/projects", handleCreateProject)
 	mux.HandleFunc("DELETE /api/projects/{key}", handleDeleteProject)
 	mux.HandleFunc("GET /api/tickets", handleGetTickets)
+	mux.HandleFunc("GET /api/tickets/{id}", handleGetTicket)
 	mux.HandleFunc("POST /api/tickets", handleCreateTicket)
+	mux.HandleFunc("PATCH /api/tickets/{id}", handleUpdateTicket)
 	mux.HandleFunc("POST /api/tickets/{id}/move", handleMoveTicket)
+	mux.HandleFunc("POST /api/tickets/{id}/comments", handleAddComment)
 	mux.HandleFunc("POST /api/tickets/{id}/blocks", handleAddBlock)
 	mux.HandleFunc("DELETE /api/tickets/{id}/blocks/{blocked_id}", handleDeleteBlock)
+	mux.HandleFunc("GET /api/settings", handleGetSettings)
+	mux.HandleFunc("POST /api/settings", handleUpdateSettings)
+	mux.HandleFunc("GET /api/export", handleExport)
 
 	log.Printf("🍎 Pippin starting on :%s (account=%s, theme=%s)", cfg.Port, cfg.AccountID, cfg.CozyTheme)
 	log.Fatal(http.ListenAndServe(":"+cfg.Port, mux))
@@ -316,6 +329,141 @@ func handleDeleteBlock(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]string{"status": "ok"})
 }
 
+func handleGetTicket(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	var t Ticket
+	err := db.QueryRow(`SELECT t.id, t.account_id, t.project_id, t.title, t.body, t.state, t.assignee, COALESCE(t.comments,''), t.created_at, t.updated_at, p.key
+		FROM tickets t JOIN projects p ON t.project_id=p.id 
+		WHERE t.id=$1 AND t.account_id=$2`, id, cfg.AccountID).Scan(
+		&t.ID, &t.AccountID, &t.ProjectID, &t.Title, &t.Body, &t.State, &t.Assignee, &t.Comments, &t.CreatedAt, &t.UpdatedAt, &t.ProjectKey)
+	if err != nil {
+		writeJSON(w, 404, map[string]string{"error": "ticket not found"})
+		return
+	}
+	t.BlockedBy = queryBlockers(t.ID)
+	writeJSON(w, 200, t)
+}
+
+func handleUpdateTicket(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	var req struct {
+		Title    string `json:"title"`
+		Body     string `json:"body"`
+		Assignee string `json:"assignee"`
+		State    string `json:"state"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, 400, map[string]string{"error": "invalid json"})
+		return
+	}
+
+	_, err := db.Exec(`UPDATE tickets SET title=$1, body=$2, assignee=$3, state=$4, updated_at=now() 
+		WHERE id=$5 AND account_id=$6`,
+		req.Title, req.Body, req.Assignee, req.State, id, cfg.AccountID)
+	if err != nil {
+		writeJSON(w, 500, map[string]string{"error": err.Error()})
+		return
+	}
+
+	writeJSON(w, 200, map[string]string{"status": "updated"})
+}
+
+func handleAddComment(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	var req struct {
+		Comment string `json:"comment"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, 400, map[string]string{"error": "invalid json"})
+		return
+	}
+
+	// Get existing comments
+	var existing string
+	db.QueryRow("SELECT COALESCE(comments,'') FROM tickets WHERE id=$1 AND account_id=$2", id, cfg.AccountID).Scan(&existing)
+
+	// Append new comment with timestamp
+	timestamp := time.Now().Format("2006-01-02 15:04:05")
+	newComment := fmt.Sprintf("[%s] %s", timestamp, req.Comment)
+	
+	var updated string
+	if existing == "" {
+		updated = newComment
+	} else {
+		updated = existing + "\n" + newComment
+	}
+
+	_, err := db.Exec("UPDATE tickets SET comments=$1, updated_at=now() WHERE id=$2 AND account_id=$3", updated, id, cfg.AccountID)
+	if err != nil {
+		writeJSON(w, 500, map[string]string{"error": err.Error()})
+		return
+	}
+
+	writeJSON(w, 201, map[string]string{"status": "comment added"})
+}
+
+func handleGetSettings(w http.ResponseWriter, r *http.Request) {
+	settings := map[string]interface{}{
+		"sprint_length_days": cfg.SprintLength,
+		"sprint_epoch":       cfg.SprintEpoch.Format("2006-01-02"),
+		"cozy_theme":         cfg.CozyTheme,
+		"account_id":         cfg.AccountID,
+	}
+	writeJSON(w, 200, settings)
+}
+
+func handleUpdateSettings(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		SprintLength int    `json:"sprint_length_days"`
+		SprintEpoch  string `json:"sprint_epoch"`
+		CozyTheme    string `json:"cozy_theme"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, 400, map[string]string{"error": "invalid json"})
+		return
+	}
+
+	// Note: This only updates runtime config, not env vars
+	// In production, you'd want to persist these to a config file or database
+	if req.SprintLength > 0 {
+		cfg.SprintLength = req.SprintLength
+	}
+	if req.SprintEpoch != "" {
+		if t, err := time.Parse("2006-01-02", req.SprintEpoch); err == nil {
+			cfg.SprintEpoch = t
+		}
+	}
+	if req.CozyTheme != "" {
+		cfg.CozyTheme = req.CozyTheme
+	}
+
+	writeJSON(w, 200, map[string]string{"status": "settings updated (runtime only)"})
+}
+
+func handleExport(w http.ResponseWriter, r *http.Request) {
+	projects, _ := queryProjects()
+	tickets := queryTickets("ALL", "all")
+
+	export := map[string]interface{}{
+		"exported_at": time.Now().Format(time.RFC3339),
+		"account_id":  cfg.AccountID,
+		"projects":    projects,
+		"tickets":     tickets,
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=pippin-export-%s.json", time.Now().Format("2006-01-02")))
+	json.NewEncoder(w).Encode(export)
+}
+
+func initSchema() {
+	// Add comments column if it doesn't exist
+	_, err := db.Exec(`ALTER TABLE tickets ADD COLUMN IF NOT EXISTS comments TEXT DEFAULT ''`)
+	if err != nil {
+		log.Printf("schema migration warning: %v", err)
+	}
+}
+
 func queryProjects() ([]Project, error) {
 	rows, err := db.Query("SELECT id,account_id,key,name,created_at FROM projects WHERE account_id=$1 ORDER BY created_at", cfg.AccountID)
 	if err != nil {
@@ -333,7 +481,7 @@ func queryProjects() ([]Project, error) {
 }
 
 func queryTickets(projectFilter, sprint string) []Ticket {
-	query := `SELECT t.id, t.account_id, t.project_id, t.title, t.body, t.state, t.assignee, t.created_at, t.updated_at, p.key
+	query := `SELECT t.id, t.account_id, t.project_id, t.title, t.body, t.state, t.assignee, COALESCE(t.comments,''), t.created_at, t.updated_at, p.key
 		FROM tickets t JOIN projects p ON t.project_id=p.id WHERE t.account_id=$1`
 	args := []interface{}{cfg.AccountID}
 
@@ -359,7 +507,7 @@ func queryTickets(projectFilter, sprint string) []Ticket {
 	var tickets []Ticket
 	for rows.Next() {
 		var t Ticket
-		rows.Scan(&t.ID, &t.AccountID, &t.ProjectID, &t.Title, &t.Body, &t.State, &t.Assignee, &t.CreatedAt, &t.UpdatedAt, &t.ProjectKey)
+		rows.Scan(&t.ID, &t.AccountID, &t.ProjectID, &t.Title, &t.Body, &t.State, &t.Assignee, &t.Comments, &t.CreatedAt, &t.UpdatedAt, &t.ProjectKey)
 		t.BlockedBy = queryBlockers(t.ID)
 		tickets = append(tickets, t)
 	}
@@ -487,6 +635,16 @@ select{padding:4px 8px;border:1px solid var(--border);background:var(--card);col
 .search-box .clear-search{position:absolute;right:8px;top:50%;transform:translateY(-50%);background:none;border:none;color:var(--muted);cursor:pointer;padding:0;font-size:16px;display:none}
 .search-box input:not(:placeholder-shown) + .clear-search{display:block}
 .card.search-hidden{display:none!important}
+.ticket-title{cursor:pointer;text-decoration:underline;text-decoration-style:dotted}
+.ticket-title:hover{text-decoration-style:solid;color:var(--accent)}
+.comments-list{background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:12px;max-height:200px;overflow-y:auto;margin-bottom:12px;font-size:12px;white-space:pre-wrap}
+.comment-item{margin-bottom:8px;padding-bottom:8px;border-bottom:1px solid var(--border)}
+.comment-item:last-child{border-bottom:none;margin-bottom:0;padding-bottom:0}
+.comment-timestamp{color:var(--muted);font-size:11px;font-weight:600}
+.ticket-meta{background:var(--panel);border:1px solid var(--border);border-radius:8px;padding:12px;margin-bottom:12px;font-size:12px}
+.ticket-meta-item{display:flex;justify-content:space-between;margin-bottom:6px}
+.ticket-meta-item:last-child{margin-bottom:0}
+.ticket-meta-label{color:var(--muted);font-weight:600}
 </style>
 </head>
 <body>
@@ -512,6 +670,7 @@ select{padding:4px 8px;border:1px solid var(--border);background:var(--card);col
     <input type="text" id="search-input" placeholder="🔍 Search tickets..." autocomplete="off">
     <button class="clear-search" onclick="clearSearch()">✕</button>
   </div>
+  <button class="btn btn-subtle" onclick="showSettingsModal()" title="Settings">⚙️</button>
 </header>
 <div class="board">
   <div class="col" data-state="backlog" id="backlog-col">
@@ -522,7 +681,7 @@ select{padding:4px 8px;border:1px solid var(--border);background:var(--card);col
     <div class="col-content">
     {{range .Backlog}}
     <div class="card" draggable="true" data-id="{{.ID}}" data-state="backlog" data-title="{{.Title}}" data-project="{{.ProjectKey}}" data-assignee="{{.Assignee}}">
-      <strong>{{.ProjectKey}}-{{.ID}}</strong> {{.Title}}
+      <strong>{{.ProjectKey}}-{{.ID}}</strong> <span class="ticket-title" onclick="showTicketView({{.ID}})">{{.Title}}</span>
       <div class="small">{{.Assignee}}</div>
       {{range .BlockedBy}}<span class="badge">⚠ {{.}}</span>{{end}}
       <div style="margin-top:6px">
@@ -538,7 +697,7 @@ select{padding:4px 8px;border:1px solid var(--border);background:var(--card);col
     <div class="col-content">
     {{range .Todo}}
     <div class="card" draggable="true" data-id="{{.ID}}" data-state="todo" data-title="{{.Title}}" data-project="{{.ProjectKey}}" data-assignee="{{.Assignee}}">
-      <strong>{{.ProjectKey}}-{{.ID}}</strong> {{.Title}}
+      <strong>{{.ProjectKey}}-{{.ID}}</strong> <span class="ticket-title" onclick="showTicketView({{.ID}})">{{.Title}}</span>
       <div class="small">{{.Assignee}}</div>
       {{range .BlockedBy}}<span class="badge">⚠ {{.}}</span>{{end}}
       <div style="margin-top:6px">
@@ -555,7 +714,7 @@ select{padding:4px 8px;border:1px solid var(--border);background:var(--card);col
     <div class="col-content">
     {{range .InProg}}
     <div class="card" draggable="true" data-id="{{.ID}}" data-state="in_progress" data-title="{{.Title}}" data-project="{{.ProjectKey}}" data-assignee="{{.Assignee}}">
-      <strong>{{.ProjectKey}}-{{.ID}}</strong> {{.Title}}
+      <strong>{{.ProjectKey}}-{{.ID}}</strong> <span class="ticket-title" onclick="showTicketView({{.ID}})">{{.Title}}</span>
       <div class="small">{{.Assignee}}</div>
       {{range .BlockedBy}}<span class="badge">⚠ {{.}}</span>{{end}}
       <div style="margin-top:6px">
@@ -572,7 +731,7 @@ select{padding:4px 8px;border:1px solid var(--border);background:var(--card);col
     <div class="col-content">
     {{range .Done}}
     <div class="card" draggable="true" data-id="{{.ID}}" data-state="done" data-title="{{.Title}}" data-project="{{.ProjectKey}}" data-assignee="{{.Assignee}}">
-      <strong>{{.ProjectKey}}-{{.ID}}</strong> {{.Title}}
+      <strong>{{.ProjectKey}}-{{.ID}}</strong> <span class="ticket-title" onclick="showTicketView({{.ID}})">{{.Title}}</span>
       <div class="small">{{.Assignee}}</div>
       <div style="margin-top:6px">
         <button onclick="move({{.ID}},'left')">←</button>
@@ -642,6 +801,94 @@ select{padding:4px 8px;border:1px solid var(--border);background:var(--card);col
         <button type="submit" class="btn btn-hero">Create Project</button>
       </div>
     </form>
+  </div>
+</div>
+
+<!-- Settings Modal -->
+<div id="settings-modal" class="modal">
+  <div class="modal-content">
+    <h2>⚙️ Settings</h2>
+    <div style="margin-bottom:20px">
+      <h3 style="margin:0 0 8px 0;font-size:14px">Sprint Configuration</h3>
+      <div class="form-group">
+        <label>Sprint Length (days)</label>
+        <select id="settings-sprint-length">
+          <option value="7">7 days (weekly)</option>
+          <option value="14">14 days (bi-weekly)</option>
+        </select>
+      </div>
+      <div class="form-group">
+        <label>Sprint Epoch (start date)</label>
+        <input type="date" id="settings-sprint-epoch">
+      </div>
+      <div class="form-group">
+        <label>Theme</label>
+        <select id="settings-theme">
+          <option value="warm">Warm (peachy)</option>
+          <option value="forest">Forest (green)</option>
+        </select>
+      </div>
+      <button onclick="saveSettings()" class="btn btn-hero">Save Settings</button>
+      <p style="font-size:11px;color:var(--muted);margin-top:8px">
+        ⚠️ Settings only affect current session (not persisted to env vars)
+      </p>
+    </div>
+    <div style="border-top:1px solid var(--border);padding-top:16px">
+      <h3 style="margin:0 0 8px 0;font-size:14px">Export Data</h3>
+      <p style="font-size:12px;margin-bottom:12px;color:var(--muted)">
+        Download all projects and tickets as JSON
+      </p>
+      <button onclick="exportData()" class="btn">📥 Export to JSON</button>
+    </div>
+    <div class="form-actions" style="margin-top:20px">
+      <button class="btn btn-subtle" onclick="hideSettingsModal()">Close</button>
+    </div>
+  </div>
+</div>
+
+<!-- Ticket View Modal -->
+<div id="ticket-view-modal" class="modal">
+  <div class="modal-content" style="max-width:600px">
+    <h2 id="ticket-view-title">Loading...</h2>
+    <div class="ticket-meta" id="ticket-view-meta"></div>
+    
+    <div class="form-group">
+      <label>Title *</label>
+      <input type="text" id="ticket-view-title-input" required>
+    </div>
+    <div class="form-group">
+      <label>Description</label>
+      <textarea id="ticket-view-body"></textarea>
+    </div>
+    <div class="form-group">
+      <label>Assignee</label>
+      <input type="text" id="ticket-view-assignee">
+    </div>
+    <div class="form-group">
+      <label>State</label>
+      <select id="ticket-view-state">
+        <option value="backlog">Backlog</option>
+        <option value="todo">Todo</option>
+        <option value="in_progress">In Progress</option>
+        <option value="done">Done</option>
+      </select>
+    </div>
+    
+    <div style="border-top:1px solid var(--border);padding-top:16px;margin-top:16px">
+      <h3 style="margin:0 0 8px 0;font-size:14px">Comments</h3>
+      <div class="comments-list" id="ticket-view-comments">
+        <div style="color:var(--muted);font-style:italic">No comments yet</div>
+      </div>
+      <div class="form-group">
+        <textarea id="ticket-view-new-comment" placeholder="Add a comment..." rows="2"></textarea>
+      </div>
+      <button onclick="saveComment()" class="btn">💬 Save Comment</button>
+    </div>
+    
+    <div class="form-actions" style="margin-top:20px">
+      <button class="btn btn-subtle" onclick="hideTicketView()">Cancel</button>
+      <button class="btn btn-hero" onclick="saveTicketUpdates()">💾 Save Changes</button>
+    </div>
   </div>
 </div>
 
@@ -953,6 +1200,170 @@ document.addEventListener('DOMContentLoaded',()=>{
       });
     });
   });
+});
+
+// Settings Modal functions
+function showSettingsModal() {
+  fetch('/api/settings')
+    .then(r => r.json())
+    .then(data => {
+      document.getElementById('settings-sprint-length').value = data.sprint_length_days;
+      document.getElementById('settings-sprint-epoch').value = data.sprint_epoch;
+      document.getElementById('settings-theme').value = data.cozy_theme;
+      document.getElementById('settings-modal').classList.add('show');
+    });
+}
+
+function hideSettingsModal() {
+  document.getElementById('settings-modal').classList.remove('show');
+}
+
+function saveSettings() {
+  const sprintLength = parseInt(document.getElementById('settings-sprint-length').value);
+  const sprintEpoch = document.getElementById('settings-sprint-epoch').value;
+  const theme = document.getElementById('settings-theme').value;
+  
+  fetch('/api/settings', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({
+      sprint_length_days: sprintLength,
+      sprint_epoch: sprintEpoch,
+      cozy_theme: theme
+    })
+  })
+  .then(r => r.json())
+  .then(data => {
+    alert('Settings updated! Refresh page to see changes.');
+    hideSettingsModal();
+  })
+  .catch(err => alert('Error saving settings: ' + err));
+}
+
+function exportData() {
+  window.location.href = '/api/export';
+}
+
+// Ticket View Modal functions
+let currentTicketId = null;
+
+function showTicketView(ticketId) {
+  currentTicketId = ticketId;
+  
+  fetch('/api/tickets/' + ticketId)
+    .then(r => r.json())
+    .then(ticket => {
+      document.getElementById('ticket-view-title').textContent = ticket.project_key + '-' + ticket.id;
+      
+      // Populate metadata
+      const meta = document.getElementById('ticket-view-meta');
+      meta.innerHTML = 
+        '<div class="ticket-meta-item"><span class="ticket-meta-label">Project:</span><span>' + ticket.project_key + '</span></div>' +
+        '<div class="ticket-meta-item"><span class="ticket-meta-label">Created:</span><span>' + new Date(ticket.created_at).toLocaleString() + '</span></div>' +
+        '<div class="ticket-meta-item"><span class="ticket-meta-label">Updated:</span><span>' + new Date(ticket.updated_at).toLocaleString() + '</span></div>' +
+        (ticket.blocked_by && ticket.blocked_by.length > 0 ? 
+          '<div class="ticket-meta-item"><span class="ticket-meta-label">Blocked by:</span><span>' + ticket.blocked_by.join(', ') + '</span></div>' : '');
+      
+      // Populate form fields
+      document.getElementById('ticket-view-title-input').value = ticket.title;
+      document.getElementById('ticket-view-body').value = ticket.body || '';
+      document.getElementById('ticket-view-assignee').value = ticket.assignee || '';
+      document.getElementById('ticket-view-state').value = ticket.state;
+      
+      // Display comments
+      const commentsDiv = document.getElementById('ticket-view-comments');
+      if (ticket.comments && ticket.comments.trim() !== '') {
+        const comments = ticket.comments.split('\\n');
+        commentsDiv.innerHTML = comments.map(c => {
+          const match = c.match(/^\\[(.+?)\\] (.+)$/);
+          if (match) {
+            return '<div class="comment-item"><div class="comment-timestamp">' + match[1] + '</div><div>' + match[2] + '</div></div>';
+          }
+          return '<div class="comment-item">' + c + '</div>';
+        }).join('');
+      } else {
+        commentsDiv.innerHTML = '<div style="color:var(--muted);font-style:italic">No comments yet</div>';
+      }
+      
+      document.getElementById('ticket-view-new-comment').value = '';
+      document.getElementById('ticket-view-modal').classList.add('show');
+    })
+    .catch(err => alert('Error loading ticket: ' + err));
+}
+
+function hideTicketView() {
+  document.getElementById('ticket-view-modal').classList.remove('show');
+  currentTicketId = null;
+}
+
+function saveComment() {
+  const comment = document.getElementById('ticket-view-new-comment').value.trim();
+  if (!comment) {
+    alert('Please enter a comment');
+    return;
+  }
+  
+  fetch('/api/tickets/' + currentTicketId + '/comments', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({comment: comment})
+  })
+  .then(r => r.json())
+  .then(data => {
+    if (data.error) {
+      alert('Error: ' + data.error);
+    } else {
+      // Reload ticket to show new comment
+      showTicketView(currentTicketId);
+    }
+  })
+  .catch(err => alert('Error saving comment: ' + err));
+}
+
+function saveTicketUpdates() {
+  const title = document.getElementById('ticket-view-title-input').value.trim();
+  const body = document.getElementById('ticket-view-body').value;
+  const assignee = document.getElementById('ticket-view-assignee').value;
+  const state = document.getElementById('ticket-view-state').value;
+  
+  if (!title) {
+    alert('Title is required');
+    return;
+  }
+  
+  fetch('/api/tickets/' + currentTicketId, {
+    method: 'PATCH',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({
+      title: title,
+      body: body,
+      assignee: assignee,
+      state: state
+    })
+  })
+  .then(r => r.json())
+  .then(data => {
+    if (data.error) {
+      alert('Error: ' + data.error);
+    } else {
+      hideTicketView();
+      location.reload();
+    }
+  })
+  .catch(err => alert('Error saving changes: ' + err));
+}
+
+// Close modals on Escape key or click outside
+document.addEventListener('click', (e) => {
+  if (e.target.classList.contains('modal')) {
+    e.target.classList.remove('show');
+  }
+});
+
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape') {
+    document.querySelectorAll('.modal').forEach(m => m.classList.remove('show'));
+  }
 });
 </script>
 </body>
